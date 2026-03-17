@@ -204,31 +204,68 @@ function utcNow() {
 
 // ── Command handlers ───────────────────────────────────────────────
 
-bot.onText(/\/start|\/help/, (msg) => {
+bot.onText(/\/start(@\w+)?(\s|$)/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     `🐸 *Meme Intelligence Bot*\n\n` +
-      `Track any token with real-time DexScreener data.\n\n` +
-      `*Token Commands (pass name or address):*\n` +
-      `/market PEPE - Live market data\n` +
-      `/scan PEPE - Momentum scan (volume + buy pressure)\n` +
-      `/alert PEPE - Breakout probability\n` +
-      `/rug PEPE - Rug-pull risk check\n\n` +
-      `*Examples:*\n` +
-      `/market BONK\n` +
-      `/scan 0x6982...abc (contract address)\n` +
-      `/rug WIF\n\n` +
-      `*Discovery Commands:*\n` +
-      `/trending - Boosted/trending tokens\n` +
-      `/newpairs - Freshly launched tokens (<24h)\n\n` +
-      `*Social (coming soon):*\n` +
-      `/social - Social buzz (pending Twitter API)\n` +
-      `/trust - Trust analysis (pending Twitter API)`,
+      `Real-time token intelligence powered by DexScreener.\n` +
+      `Use /help for the full command list.`,
     { parse_mode: "Markdown" }
   );
 });
 
-bot.onText(/\/market(?:\s+(.+))?/, async (msg, match) => {
+bot.onText(/\/help(@\w+)?(\s|$)/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    `🐸 *Meme Intelligence Bot — Commands*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+
+      `📊 */market <token>*\n` +
+      `_Get live market data for any token._\n` +
+      `Shows price, price changes (5m/1h/6h/24h), volume, liquidity, market cap, and buy/sell counts.\n` +
+      `Use this to get a quick snapshot of where a token stands right now.\n` +
+      `Example: /market PEPE\n` +
+      `Example: /market 0x6982508145454Ce325dDbE47a25d4ec3d2311933\n\n` +
+
+      `⚡ */scan <token>*\n` +
+      `_Momentum scanner — detect volume surges and buy pressure shifts._\n` +
+      `Compares current 5m volume against the 24h average to detect unusual spikes. Shows buy vs sell pressure across 5m, 1h, and 24h timeframes.\n` +
+      `Use this to spot tokens that are heating up RIGHT NOW before the price moves.\n` +
+      `Example: /scan BONK\n\n` +
+
+      `🎯 */alert <token>*\n` +
+      `_Calculate breakout probability score._\n` +
+      `Scores a token from 0-100 based on price momentum, volume strength, liquidity depth, and buy pressure. Tells you if the market is CONFIRMING, ACTIVE, STABLE, or COOLING.\n` +
+      `Use this to decide if a token has real momentum or is fading.\n` +
+      `Example: /alert WIF\n\n` +
+
+      `🔍 */rug <token>*\n` +
+      `_Quick rug-pull risk assessment._\n` +
+      `Checks liquidity depth, token age, sell pressure, price dumps, volume/liquidity ratio, and market cap/liquidity ratio. Scores risk from 0-100 (LOW to EXTREME).\n` +
+      `Use this before aping into any new token.\n` +
+      `Example: /rug DOGE\n\n` +
+
+      `🔥 */trending*\n` +
+      `_See what tokens are being promoted on DexScreener._\n` +
+      `Shows the top boosted tokens with their price, volume, and liquidity. Projects spend money to boost their tokens here — useful to see what's getting marketing push.\n\n` +
+
+      `🆕 */newpairs*\n` +
+      `_Discover freshly launched tokens (<24h old)._\n` +
+      `Filters for new pairs with at least $1K liquidity. Shows launch time, price, volume, and buy pressure. Extremely high risk — for discovery only.\n\n` +
+
+      `🐦 */social* — _Coming soon (needs Twitter API)_\n` +
+      `🔍 */trust* — _Coming soon (needs Twitter API)_\n\n` +
+
+      `*How to pass a token:*\n` +
+      `• By name: /market PEPE\n` +
+      `• By symbol: /scan BONK\n` +
+      `• By contract address: /rug 0x6982...\n` +
+      `The bot searches DexScreener and picks the highest-liquidity match.`,
+    { parse_mode: "Markdown" }
+  );
+});
+
+bot.onText(/\/market(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
   const query = (match && match[1]) ? match[1].trim() : "";
   if (!query) {
     return bot.sendMessage(msg.chat.id, "Usage: `/market <token>`\nExample: `/market PEPE`", { parse_mode: "Markdown" });
@@ -260,7 +297,7 @@ bot.onText(/\/market(?:\s+(.+))?/, async (msg, match) => {
   );
 });
 
-bot.onText(/\/social/, (msg) => {
+bot.onText(/\/social(?:@\w+)?(\s|$)/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     `🐦 *Social Analysis*\n\n` +
@@ -269,7 +306,7 @@ bot.onText(/\/social/, (msg) => {
   );
 });
 
-bot.onText(/\/trust/, (msg) => {
+bot.onText(/\/trust(?:@\w+)?(\s|$)/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     `🔍 *Trust Analysis*\n\n` +
@@ -278,7 +315,7 @@ bot.onText(/\/trust/, (msg) => {
   );
 });
 
-bot.onText(/\/alert(?:\s+(.+))?/, async (msg, match) => {
+bot.onText(/\/alert(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
   const query = (match && match[1]) ? match[1].trim() : "";
   if (!query) {
     return bot.sendMessage(msg.chat.id, "Usage: `/alert <token>`\nExample: `/alert PEPE`", { parse_mode: "Markdown" });
@@ -308,7 +345,7 @@ bot.onText(/\/alert(?:\s+(.+))?/, async (msg, match) => {
 
 // ── /scan — Momentum scan across all timeframes ───────────────────
 
-bot.onText(/\/scan(?:\s+(.+))?/, async (msg, match) => {
+bot.onText(/\/scan(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
   const query = (match && match[1]) ? match[1].trim() : "";
   if (!query) {
     return bot.sendMessage(msg.chat.id, "Usage: `/scan <token>`\nExample: `/scan PEPE`", { parse_mode: "Markdown" });
@@ -365,7 +402,7 @@ bot.onText(/\/scan(?:\s+(.+))?/, async (msg, match) => {
 
 // ── /trending — Boosted tokens on DexScreener ─────────────────────
 
-bot.onText(/\/trending/, async (msg) => {
+bot.onText(/\/trending(?:@\w+)?(\s|$)/, async (msg) => {
   bot.sendMessage(msg.chat.id, "Fetching trending tokens...");
 
   const boosted = await fetchBoostedTokens();
@@ -423,7 +460,7 @@ bot.onText(/\/trending/, async (msg) => {
 
 // ── /newpairs — Freshly launched tokens ───────────────────────────
 
-bot.onText(/\/newpairs/, async (msg) => {
+bot.onText(/\/newpairs(?:@\w+)?(\s|$)/, async (msg) => {
   bot.sendMessage(msg.chat.id, "Scanning for new pairs (<24h old)...");
 
   const profiles = await fetchTokenProfiles();
@@ -486,7 +523,7 @@ bot.onText(/\/newpairs/, async (msg) => {
 
 // ── /rug — Quick rug-pull risk check ──────────────────────────────
 
-bot.onText(/\/rug(?:\s+(.+))?/, async (msg, match) => {
+bot.onText(/\/rug(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
   const query = (match && match[1]) ? match[1].trim() : "";
 
   if (!query) {
