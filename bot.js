@@ -145,6 +145,87 @@ async function searchToken(query) {
   return Object.values(seen).map((s) => parsePair(s.pair));
 }
 
+// ── Moralis API helpers ────────────────────────────────────────────
+
+const MORALIS_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjAxODZjZGZhLTgwMzYtNGQ1OS1iMDBjLTY3MDc4N2RlNzMwYyIsIm9yZ0lkIjoiNTA1ODI0IiwidXNlcklkIjoiNTIwNDYyIiwidHlwZUlkIjoiMDQzNGJlOGItYjdkOC00OTBhLWJhYmMtNzliNzZmNjczNTZhIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NzM3NjQ4MzAsImV4cCI6NDkyOTUyNDgzMH0.k1DDMBzzEexgFVKKQo52q-H4Kz-L0Fnu9Byam2uY8mk";
+
+function moralisGet(path) {
+  return new Promise((resolve) => {
+    const opts = {
+      hostname: "deep-index.moralis.io",
+      path,
+      headers: { "X-API-Key": MORALIS_API_KEY, Accept: "application/json" },
+    };
+    https
+      .get(opts, (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          try { resolve(JSON.parse(data)); } catch { resolve(null); }
+        });
+      })
+      .on("error", () => resolve(null));
+  });
+}
+
+/**
+ * Get all pairs for a token from Moralis, then fetch snipers for each pair.
+ * Returns { pairAddress, pairLabel, exchange, snipers[], blockTimestamp }
+ */
+async function fetchSnipers(tokenAddress, chain) {
+  // Map DexScreener chain IDs to Moralis chain params
+  const chainMap = {
+    ethereum: "eth", eth: "eth",
+    bsc: "bsc", arbitrum: "arbitrum",
+    polygon: "polygon", base: "base",
+    optimism: "optimism", avalanche: "avalanche",
+  };
+  const moralisChain = chainMap[chain] || "eth";
+
+  // Step 1: Get pairs from Moralis
+  const pairsData = await moralisGet(
+    `/api/v2.2/erc20/${tokenAddress}/pairs?chain=${moralisChain}`
+  );
+
+  const pairs = pairsData?.pairs || [];
+  if (!pairs.length) return { error: "No pairs found on Moralis" };
+
+  // Step 2: Try snipers on each pair (start with V2, then V3)
+  // Prefer standard 42-char addresses (V2/V3), skip V4 hashes
+  const sortedPairs = pairs.sort((a, b) => {
+    const aStd = a.pair_address?.length === 42 ? 1 : 0;
+    const bStd = b.pair_address?.length === 42 ? 1 : 0;
+    return bStd - aStd;
+  });
+
+  for (const pair of sortedPairs.slice(0, 5)) {
+    const snipersData = await moralisGet(
+      `/api/v2.2/pairs/${pair.pair_address}/snipers?chain=${moralisChain}`
+    );
+
+    if (snipersData && snipersData.result && snipersData.result.length > 0) {
+      return {
+        pairAddress: pair.pair_address,
+        pairLabel: pair.pair_label || "?",
+        exchange: pair.exchange_name || "?",
+        blockNumber: snipersData.blockNumber,
+        blockTimestamp: snipersData.blockTimestamp,
+        snipers: snipersData.result,
+      };
+    }
+  }
+
+  // No snipers found on any pair
+  return {
+    pairAddress: sortedPairs[0]?.pair_address || "",
+    pairLabel: sortedPairs[0]?.pair_label || "?",
+    exchange: sortedPairs[0]?.exchange_name || "?",
+    blockNumber: 0,
+    blockTimestamp: "",
+    snipers: [],
+  };
+}
+
 // ── Breakout calculation ───────────────────────────────────────────
 
 function calculateBreakout(t) {
@@ -252,6 +333,13 @@ bot.onText(/\/help(@\w+)?(\s|$)/, (msg) => {
       `🆕 */newpairs*\n` +
       `_Discover freshly launched tokens (<24h old)._\n` +
       `Filters for new pairs with at least $1K liquidity. Shows launch time, price, volume, and buy pressure. Extremely high risk — for discovery only.\n\n` +
+
+      `🔫 */sniper <token>*\n` +
+      `_Detect sniper bots that bought in the first blocks after launch._\n` +
+      `Shows how many wallets sniped, whether they bought in the same block as liquidity (most suspicious), their profit/loss, and if they still hold or dumped.\n` +
+      `Use this to check if a token had insider buying at launch.\n` +
+      `Example: /sniper NUR\n` +
+      `Note: EVM chains only (ETH, BSC, Base, etc.)\n\n` +
 
       `🐦 */social* — _Coming soon (needs Twitter API)_\n` +
       `🔍 */trust* — _Coming soon (needs Twitter API)_\n\n` +
@@ -682,6 +770,172 @@ bot.onText(/\/rug(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
 
   msg_text += `\n⚠️ _This is automated analysis only. Always DYOR._\n🕐 ${utcNow()}`;
   bot.sendMessage(msg.chat.id, msg_text, { parse_mode: "Markdown" });
+});
+
+// ── /sniper — Sniper bot detection via Moralis ────────────────────
+
+bot.onText(/\/sniper(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
+  const query = (match && match[1]) ? match[1].trim() : "";
+  if (!query) {
+    return bot.sendMessage(
+      msg.chat.id,
+      "Usage: `/sniper <token name or address>`\n" +
+        "Example: `/sniper 0xf4BC00...` or `/sniper NUR`\n\n" +
+        "_Detects wallets that bought in the first blocks after liquidity was added. " +
+        "Shows profit/loss, holding status, and entry timing._",
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  bot.sendMessage(msg.chat.id, `🔫 Scanning for snipers on: ${query}...`);
+
+  // Resolve token via DexScreener first to get address + chain
+  const token = await resolveToken(query);
+  if (!token) {
+    return bot.sendMessage(msg.chat.id, `Could not find token: ${query}`);
+  }
+
+  // Only EVM chains supported by Moralis snipers API
+  const evmChains = ["ethereum", "bsc", "arbitrum", "polygon", "base", "optimism", "avalanche"];
+  if (!evmChains.includes(token.chain)) {
+    return bot.sendMessage(
+      msg.chat.id,
+      `Sniper detection currently supports EVM chains only.\n${token.symbol} is on ${token.chain}.`
+    );
+  }
+
+  const data = await fetchSnipers(token.address, token.chain);
+
+  if (data.error) {
+    return bot.sendMessage(msg.chat.id, `Error: ${data.error}`);
+  }
+
+  if (!data.snipers.length) {
+    return bot.sendMessage(
+      msg.chat.id,
+      `🔫 *Sniper Check: ${token.symbol}*\n\n` +
+        `Pair: ${data.pairLabel} (${data.exchange})\n\n` +
+        `✅ No snipers detected on this pair.\n` +
+        `_This could mean the token is older (data not available) or no wallets bought in the first blocks._`,
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  // Analyze snipers
+  const snipers = data.snipers;
+  const totalSnipers = snipers.length;
+
+  // Categorize
+  const stillHolding = snipers.filter((s) => s.currentBalance > 0);
+  const soldAll = snipers.filter((s) => s.currentBalance === 0);
+  const profitable = snipers.filter((s) => s.realizedProfitUsd > 0);
+  const totalSnipedUsd = snipers.reduce((sum, s) => sum + (s.totalSnipedUsd || 0), 0);
+  const totalSoldUsd = snipers.reduce((sum, s) => sum + (s.totalSoldUsd || 0), 0);
+  const totalRealizedProfit = snipers.reduce((sum, s) => sum + (s.realizedProfitUsd || 0), 0);
+  const totalUnrealizedProfit = snipers.reduce((sum, s) => sum + (s.unrealizedProfitUsd || 0), 0);
+
+  // Block 0 snipers (same block as liquidity = most suspicious)
+  const block0 = snipers.filter((s) =>
+    s.snipedTransactions?.some((tx) => tx.blocksAfterCreation === 0)
+  );
+  const block1 = snipers.filter((s) =>
+    s.snipedTransactions?.some((tx) => tx.blocksAfterCreation === 1)
+  );
+
+  // Format creation info
+  let creationInfo = "";
+  if (data.blockTimestamp) {
+    const created = new Date(data.blockTimestamp);
+    const ageH = (Date.now() - created.getTime()) / (1000 * 60 * 60);
+    const ageLabel =
+      ageH < 1 ? `${Math.round(ageH * 60)}m ago` :
+      ageH < 24 ? `${ageH.toFixed(1)}h ago` :
+      `${(ageH / 24).toFixed(1)}d ago`;
+    creationInfo = `Pair created: ${created.toISOString().slice(0, 16)} UTC (${ageLabel})`;
+  }
+
+  // Build message
+  let text =
+    `🔫 *Sniper Analysis: ${token.symbol}*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `*Pair:* ${data.pairLabel} (${data.exchange})\n` +
+    (creationInfo ? `*${creationInfo}*\n` : "") +
+    `\n` +
+    `*Overview:*\n` +
+    `├ Total snipers: ${totalSnipers}\n` +
+    `├ Same-block (block 0): ${block0.length} 🚨\n` +
+    `├ Block 1: ${block1.length}\n` +
+    `├ Still holding: ${stillHolding.length}\n` +
+    `├ Sold everything: ${soldAll.length}\n` +
+    `└ Profitable: ${profitable.length}/${totalSnipers}\n\n` +
+    `*Money Flow:*\n` +
+    `├ Total sniped: ${fmtUsd(totalSnipedUsd)}\n` +
+    `├ Total sold: ${fmtUsd(totalSoldUsd)}\n` +
+    `├ Realized P/L: ${totalRealizedProfit >= 0 ? "+" : ""}${fmtUsd(totalRealizedProfit)}\n` +
+    `└ Unrealized P/L: ${totalUnrealizedProfit >= 0 ? "+" : ""}${fmtUsd(totalUnrealizedProfit)}\n`;
+
+  // Top snipers detail (top 5 by sniped amount)
+  const topSnipers = [...snipers]
+    .sort((a, b) => (b.totalSnipedUsd || 0) - (a.totalSnipedUsd || 0))
+    .slice(0, 5);
+
+  text += `\n*Top Snipers:*\n`;
+
+  for (let i = 0; i < topSnipers.length; i++) {
+    const s = topSnipers[i];
+    const addr = s.walletAddress;
+    const shortAddr = `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+
+    // Earliest entry
+    const earliestBlock = s.snipedTransactions?.length
+      ? Math.min(...s.snipedTransactions.map((tx) => tx.blocksAfterCreation))
+      : "?";
+
+    const holdingStatus = s.currentBalance > 0
+      ? `holding ${fmtUsd(s.currentBalanceUsdValue || 0)}`
+      : "SOLD ALL";
+
+    const pnl = s.realizedProfitUsd !== 0
+      ? `P/L: ${s.realizedProfitUsd >= 0 ? "+" : ""}${fmtUsd(s.realizedProfitUsd)} (${s.realizedProfitPercentage >= 0 ? "+" : ""}${(s.realizedProfitPercentage || 0).toFixed(0)}%)`
+      : s.unrealizedProfitUsd !== 0
+        ? `Unrealized: ${s.unrealizedProfitUsd >= 0 ? "+" : ""}${fmtUsd(s.unrealizedProfitUsd)}`
+        : "No P/L yet";
+
+    const blockEmoji = earliestBlock === 0 ? "🚨" : earliestBlock <= 2 ? "⚠️" : "📍";
+
+    text +=
+      `\n${blockEmoji} *${i + 1}. ${shortAddr}*\n` +
+      `├ Entry: block +${earliestBlock} | Sniped: ${fmtUsd(s.totalSnipedUsd || 0)}\n` +
+      `├ ${holdingStatus}\n` +
+      `└ ${pnl}\n`;
+  }
+
+  // Risk assessment
+  const sameBlockPct = totalSnipers > 0 ? (block0.length / totalSnipers * 100) : 0;
+  const soldAllPct = totalSnipers > 0 ? (soldAll.length / totalSnipers * 100) : 0;
+
+  let riskLevel, riskEmoji;
+  if (block0.length >= 3 && soldAllPct > 60) {
+    riskLevel = "HIGH — Multiple same-block snipers + most dumped";
+    riskEmoji = "🔴";
+  } else if (block0.length >= 2 || (totalSnipers >= 5 && soldAllPct > 50)) {
+    riskLevel = "MODERATE — Sniper activity detected";
+    riskEmoji = "🟠";
+  } else if (totalSnipers >= 1) {
+    riskLevel = "LOW — Minor sniper activity";
+    riskEmoji = "🟡";
+  } else {
+    riskLevel = "NONE";
+    riskEmoji = "🟢";
+  }
+
+  text +=
+    `\n${riskEmoji} *Sniper Risk: ${riskLevel}*\n\n` +
+    `⚠️ _Same-block buyers (block 0) are most likely bots or insiders. ` +
+    `This does not confirm deployer affiliation — use /rug for additional risk signals._\n` +
+    `🕐 ${utcNow()}`;
+
+  bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
 });
 
 // ── Start ──────────────────────────────────────────────────────────
