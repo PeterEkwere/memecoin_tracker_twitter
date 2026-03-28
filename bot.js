@@ -1212,10 +1212,9 @@ bot.onText(/\/holders(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
     for (let i = 0; i < display.length; i++) {
       const h = display[i];
       const addr = h.address;
-      const short = `${addr.slice(0, 3)}...${addr.slice(-4)}`;
       const pct = h.pct.toFixed(1);
       const emoji = tierEmoji(h.pct);
-      text += `*#${i + 1}* \`${short}\` [${pct}%] ${emoji}\n`;
+      text += `*#${i + 1}* [${pct}%] ${emoji}\n\`${addr}\`\n`;
     }
 
     // Concentration summary
@@ -1417,15 +1416,12 @@ bot.onText(/\/holders(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
   for (let i = 0; i < displayHolders.length; i++) {
     const h = displayHolders[i];
     const addr = h.owner_address;
-    const shortAddr = `${addr.slice(0, 6)}...${addr.slice(-4)}`;
     const pct = (h.percentage_relative_to_total_supply || 0).toFixed(2);
     const usd = parseFloat(h.usd_value) || 0;
     const label = h.owner_address_label || "";
     const tag = h.is_contract ? " [contract]" : label ? ` [${label}]` : "";
-    const connector = i < displayHolders.length - 1 ? "├" : "└";
 
-    text += `${connector} ${i + 1}. ${shortAddr}${tag}\n`;
-    text += `${i < displayHolders.length - 1 ? "│" : " "}   ${pct}% — ${fmtUsd(usd)}\n`;
+    text += `*${i + 1}.* ${pct}% — ${fmtUsd(usd)}${tag}\n\`${addr}\`\n`;
   }
 
   // Exchanges detected
