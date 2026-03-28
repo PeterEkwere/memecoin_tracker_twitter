@@ -226,6 +226,33 @@ async function fetchSnipers(tokenAddress, chain) {
   };
 }
 
+/**
+ * Fetch top holders for a token via Moralis.
+ * Returns { totalSupply, holders[], error? }
+ */
+async function fetchHolders(tokenAddress, chain) {
+  const chainMap = {
+    ethereum: "eth", eth: "eth",
+    bsc: "bsc", arbitrum: "arbitrum",
+    polygon: "polygon", base: "base",
+    optimism: "optimism", avalanche: "avalanche",
+  };
+  const moralisChain = chainMap[chain] || "eth";
+
+  const data = await moralisGet(
+    `/api/v2.2/erc20/${tokenAddress}/owners?chain=${moralisChain}&limit=50&order=DESC`
+  );
+
+  if (!data || data.message) {
+    return { error: data?.message || "Failed to fetch holders" };
+  }
+
+  return {
+    totalSupply: data.totalSupply || "0",
+    holders: data.result || [],
+  };
+}
+
 // ── Breakout calculation ───────────────────────────────────────────
 
 function calculateBreakout(t) {
@@ -339,6 +366,13 @@ bot.onText(/\/help(@\w+)?(\s|$)/, (msg) => {
       `Shows how many wallets sniped, whether they bought in the same block as liquidity (most suspicious), their profit/loss, and if they still hold or dumped.\n` +
       `Use this to check if a token had insider buying at launch.\n` +
       `Example: /sniper NUR\n` +
+      `Note: EVM chains only (ETH, BSC, Base, etc.)\n\n` +
+
+      `👥 */holders <token>*\n` +
+      `_Full holder distribution analysis._\n` +
+      `Shows top 10 holders with labels (exchanges, contracts, burn addresses), concentration risk (top 5/10/20), whale vs retail breakdown, and exchange presence.\n` +
+      `Use this to check if a token is well-distributed or if a few wallets control everything.\n` +
+      `Example: /holders PEPE\n` +
       `Note: EVM chains only (ETH, BSC, Base, etc.)\n\n` +
 
       `🐦 */social* — _Coming soon (needs Twitter API)_\n` +
@@ -933,6 +967,215 @@ bot.onText(/\/sniper(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
     `\n${riskEmoji} *Sniper Risk: ${riskLevel}*\n\n` +
     `⚠️ _Same-block buyers (block 0) are most likely bots or insiders. ` +
     `This does not confirm deployer affiliation — use /rug for additional risk signals._\n` +
+    `🕐 ${utcNow()}`;
+
+  bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
+});
+
+// ── /holders — Token holder analysis via Moralis ──────────────────
+
+bot.onText(/\/holders(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
+  const query = (match && match[1]) ? match[1].trim() : "";
+  if (!query) {
+    return bot.sendMessage(
+      msg.chat.id,
+      "Usage: `/holders <token name or address>`\n" +
+        "Example: `/holders PEPE` or `/holders 0x6982...`\n\n" +
+        "_Shows top holders, concentration risk, whale vs retail breakdown, " +
+        "and flags suspicious distribution patterns._",
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  bot.sendMessage(msg.chat.id, `📊 Analyzing holders for: ${query}...`);
+
+  // Resolve token
+  const token = await resolveToken(query);
+  if (!token) {
+    return bot.sendMessage(msg.chat.id, `Could not find token: ${query}`);
+  }
+
+  const evmChains = ["ethereum", "bsc", "arbitrum", "polygon", "base", "optimism", "avalanche"];
+  if (!evmChains.includes(token.chain)) {
+    return bot.sendMessage(
+      msg.chat.id,
+      `Holder analysis supports EVM chains only.\n${token.symbol} is on ${token.chain}.`
+    );
+  }
+
+  const data = await fetchHolders(token.address, token.chain);
+
+  if (data.error) {
+    return bot.sendMessage(msg.chat.id, `Error: ${data.error}`);
+  }
+
+  if (!data.holders.length) {
+    return bot.sendMessage(msg.chat.id, `No holder data found for ${token.symbol}.`);
+  }
+
+  const holders = data.holders;
+
+  // ── Categorize holders ──
+
+  // Known infrastructure (exchanges, bridges, burn, LP pools)
+  const infraKeywords = [
+    "binance", "coinbase", "kraken", "okx", "bybit", "kucoin", "bitfinex",
+    "gate.io", "huobi", "htx", "bithumb", "upbit", "bitstamp", "gemini",
+    "uniswap", "sushiswap", "pancakeswap", "curve", "balancer",
+    "burn", "dead", "null", "bridge", "hot wallet", "cold wallet",
+    "pool", "router", "treasury",
+  ];
+
+  function isInfra(h) {
+    const label = (h.owner_address_label || "").toLowerCase();
+    const addr = h.owner_address.toLowerCase();
+    if (addr === "0x0000000000000000000000000000000000000000") return true;
+    if (addr === "0x000000000000000000000000000000000000dead") return true;
+    if (h.is_contract) return true;
+    return infraKeywords.some((kw) => label.includes(kw));
+  }
+
+  const infraHolders = holders.filter(isInfra);
+  const realHolders = holders.filter((h) => !isInfra(h));
+
+  // ── Concentration metrics ──
+
+  const top5 = realHolders.slice(0, 5);
+  const top10 = realHolders.slice(0, 10);
+  const top20 = realHolders.slice(0, 20);
+
+  const top5pct = top5.reduce((s, h) => s + (h.percentage_relative_to_total_supply || 0), 0);
+  const top10pct = top10.reduce((s, h) => s + (h.percentage_relative_to_total_supply || 0), 0);
+  const top20pct = top20.reduce((s, h) => s + (h.percentage_relative_to_total_supply || 0), 0);
+
+  const infraPct = infraHolders.reduce((s, h) => s + (h.percentage_relative_to_total_supply || 0), 0);
+
+  // ── Whale tiers ──
+
+  const whales = realHolders.filter((h) => (h.percentage_relative_to_total_supply || 0) >= 1);
+  const midBags = realHolders.filter((h) => {
+    const pct = h.percentage_relative_to_total_supply || 0;
+    return pct >= 0.1 && pct < 1;
+  });
+  const smallBags = realHolders.filter((h) => (h.percentage_relative_to_total_supply || 0) < 0.1);
+
+  // ── Risk assessment ──
+
+  let riskScore = 0;
+  const risks = [];
+  const positives = [];
+
+  // Single holder dominance
+  if (realHolders[0] && realHolders[0].percentage_relative_to_total_supply > 10) {
+    risks.push(`🚨 Top holder owns ${realHolders[0].percentage_relative_to_total_supply.toFixed(1)}% of supply`);
+    riskScore += 30;
+  } else if (realHolders[0] && realHolders[0].percentage_relative_to_total_supply > 5) {
+    risks.push(`⚠️ Top holder owns ${realHolders[0].percentage_relative_to_total_supply.toFixed(1)}%`);
+    riskScore += 15;
+  }
+
+  // Top 5 concentration
+  if (top5pct > 30) {
+    risks.push(`🚨 Top 5 wallets hold ${top5pct.toFixed(1)}% — heavy concentration`);
+    riskScore += 25;
+  } else if (top5pct > 15) {
+    risks.push(`⚠️ Top 5 wallets hold ${top5pct.toFixed(1)}%`);
+    riskScore += 10;
+  } else {
+    positives.push(`✅ Top 5 wallets hold only ${top5pct.toFixed(1)}% — well distributed`);
+  }
+
+  // Whale count
+  if (whales.length >= 5 && top10pct > 25) {
+    risks.push(`⚠️ ${whales.length} whales (>1% each) — coordinated dump risk`);
+    riskScore += 15;
+  }
+
+  // Few real holders in top 50
+  if (realHolders.length < 10) {
+    risks.push(`🚨 Only ${realHolders.length} non-infrastructure holders in top 50`);
+    riskScore += 20;
+  } else if (realHolders.length > 30) {
+    positives.push(`✅ ${realHolders.length} unique wallets in top 50 — good spread`);
+  }
+
+  // Exchange presence (positive signal)
+  const exchanges = infraHolders.filter((h) => {
+    const label = (h.owner_address_label || "").toLowerCase();
+    return ["binance", "coinbase", "kraken", "okx", "bybit", "kucoin", "bithumb", "upbit", "bitfinex", "gemini"].some((ex) => label.includes(ex));
+  });
+  if (exchanges.length >= 3) {
+    positives.push(`✅ Listed on ${exchanges.length} major exchanges`);
+  } else if (exchanges.length >= 1) {
+    positives.push(`✅ On ${exchanges.length} exchange(s)`);
+  }
+
+  riskScore = Math.min(riskScore, 100);
+
+  let riskLevel, riskEmoji;
+  if (riskScore >= 50) { riskLevel = "HIGH"; riskEmoji = "🔴"; }
+  else if (riskScore >= 25) { riskLevel = "MODERATE"; riskEmoji = "🟠"; }
+  else if (riskScore >= 10) { riskLevel = "LOW"; riskEmoji = "🟡"; }
+  else { riskLevel = "HEALTHY"; riskEmoji = "🟢"; }
+
+  // ── Build message ──
+
+  let text =
+    `👥 *${token.symbol} Holder Analysis* ${riskEmoji}\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+  // Concentration overview
+  text +=
+    `*Concentration (non-infrastructure wallets):*\n` +
+    `├ Top 1 holder: ${realHolders[0] ? realHolders[0].percentage_relative_to_total_supply.toFixed(2) + "%" : "N/A"}\n` +
+    `├ Top 5 hold: ${top5pct.toFixed(2)}%\n` +
+    `├ Top 10 hold: ${top10pct.toFixed(2)}%\n` +
+    `└ Top 20 hold: ${top20pct.toFixed(2)}%\n\n`;
+
+  // Distribution breakdown
+  text +=
+    `*Distribution:*\n` +
+    `├ 🐋 Whales (>1%): ${whales.length} wallets\n` +
+    `├ 💼 Mid bags (0.1-1%): ${midBags.length} wallets\n` +
+    `├ 🐟 Small bags (<0.1%): ${smallBags.length} wallets\n` +
+    `└ 🏛 Infrastructure: ${infraHolders.length} (${infraPct.toFixed(1)}% of supply)\n\n`;
+
+  // Top 10 holders
+  text += `*Top 10 Holders:*\n`;
+
+  const displayHolders = holders.slice(0, 10);
+  for (let i = 0; i < displayHolders.length; i++) {
+    const h = displayHolders[i];
+    const addr = h.owner_address;
+    const shortAddr = `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+    const pct = (h.percentage_relative_to_total_supply || 0).toFixed(2);
+    const usd = parseFloat(h.usd_value) || 0;
+    const label = h.owner_address_label || "";
+    const tag = h.is_contract ? " [contract]" : label ? ` [${label}]` : "";
+    const connector = i < displayHolders.length - 1 ? "├" : "└";
+
+    text += `${connector} ${i + 1}. ${shortAddr}${tag}\n`;
+    text += `${i < displayHolders.length - 1 ? "│" : " "}   ${pct}% — ${fmtUsd(usd)}\n`;
+  }
+
+  // Exchanges detected
+  if (exchanges.length > 0) {
+    text += `\n*Exchange Presence:*\n`;
+    for (const ex of exchanges.slice(0, 5)) {
+      const pct = (ex.percentage_relative_to_total_supply || 0).toFixed(2);
+      text += `├ ${ex.owner_address_label}: ${pct}%\n`;
+    }
+  }
+
+  // Risk flags
+  if (risks.length || positives.length) {
+    text += `\n*Signals:*\n`;
+    for (const r of risks) text += `${r}\n`;
+    for (const p of positives) text += `${p}\n`;
+  }
+
+  text +=
+    `\n${riskEmoji} *Holder Risk: ${riskLevel}* (${riskScore}/100)\n\n` +
     `🕐 ${utcNow()}`;
 
   bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
