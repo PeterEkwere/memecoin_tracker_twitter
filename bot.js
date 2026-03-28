@@ -145,6 +145,70 @@ async function searchToken(query) {
   return Object.values(seen).map((s) => parsePair(s.pair));
 }
 
+// ── Helius RPC (Solana) ────────────────────────────────────────────
+
+const HELIUS_API_KEY = "9e4131db-46f0-44b0-9823-34a95674fb59";
+
+/**
+ * Fetch top 20 largest token holders via Helius RPC (getTokenLargestAccounts).
+ */
+function fetchHeliusTopHolders(mintAddress) {
+  return new Promise((resolve) => {
+    const postData = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getTokenLargestAccounts",
+      params: [mintAddress],
+    });
+    const opts = {
+      hostname: "mainnet.helius-rpc.com",
+      path: `/?api-key=${HELIUS_API_KEY}`,
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(postData) },
+    };
+    const req = https.request(opts, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); } catch { resolve(null); }
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.write(postData);
+    req.end();
+  });
+}
+
+/**
+ * Fetch total supply for a Solana token via Helius RPC (getTokenSupply).
+ */
+function fetchHeliusTokenSupply(mintAddress) {
+  return new Promise((resolve) => {
+    const postData = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getTokenSupply",
+      params: [mintAddress],
+    });
+    const opts = {
+      hostname: "mainnet.helius-rpc.com",
+      path: `/?api-key=${HELIUS_API_KEY}`,
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(postData) },
+    };
+    const req = https.request(opts, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); } catch { resolve(null); }
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.write(postData);
+    req.end();
+  });
+}
+
 // ── Moralis API helpers ────────────────────────────────────────────
 
 const MORALIS_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjAxODZjZGZhLTgwMzYtNGQ1OS1iMDBjLTY3MDc4N2RlNzMwYyIsIm9yZ0lkIjoiNTA1ODI0IiwidXNlcklkIjoiNTIwNDYyIiwidHlwZUlkIjoiMDQzNGJlOGItYjdkOC00OTBhLWJhYmMtNzliNzZmNjczNTZhIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NzM3NjQ4MzAsImV4cCI6NDkyOTUyNDgzMH0.k1DDMBzzEexgFVKKQo52q-H4Kz-L0Fnu9Byam2uY8mk";
@@ -1030,50 +1094,79 @@ bot.onText(/\/holders(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
 
   // ── Solana path ──
   if (isSolana) {
-    const sol = await fetchSolanaHolders(token.address);
+    // Fetch individual wallets (Helius) + aggregate stats (Moralis) in parallel
+    const [heliusRes, supplyRes, sol] = await Promise.all([
+      fetchHeliusTopHolders(token.address),
+      fetchHeliusTokenSupply(token.address),
+      fetchSolanaHolders(token.address),
+    ]);
 
-    if (!sol || sol.error || sol.message) {
-      return bot.sendMessage(msg.chat.id, `Error: ${sol?.message || sol?.error || "Failed to fetch Solana holders"}`);
+    const wallets = heliusRes?.result?.value || [];
+    const totalSupplyRaw = parseFloat(supplyRes?.result?.value?.uiAmountString) || 0;
+
+    if (!wallets.length) {
+      return bot.sendMessage(msg.chat.id, `No holder data found for ${token.symbol} on Solana.`);
     }
 
-    const total = sol.totalHolders || 0;
-    const dist = sol.holderDistribution || {};
-    const supply = sol.holderSupply || {};
-    const acq = sol.holdersByAcquisition || {};
-    const change = sol.holderChange || {};
+    // Moralis aggregate stats (optional — may fail, still show wallets)
+    const total = sol?.totalHolders || 0;
+    const dist = sol?.holderDistribution || {};
+    const acq = sol?.holdersByAcquisition || {};
+    const change = sol?.holderChange || {};
 
-    // ── Risk assessment for Solana ──
+    // Calculate percentages for each wallet
+    const holdersWithPct = wallets.map((w) => {
+      const amount = parseFloat(w.uiAmountString || w.amount) || 0;
+      const pct = totalSupplyRaw > 0 ? (amount / totalSupplyRaw) * 100 : 0;
+      return { address: w.address, amount, pct };
+    }).sort((a, b) => b.pct - a.pct);
+
+    // Tier emoji based on percentage
+    function tierEmoji(pct) {
+      if (pct >= 10) return "🐋";
+      if (pct >= 5) return "🦈";
+      if (pct >= 1) return "🐬";
+      if (pct >= 0.1) return "🐠";
+      return "🦐";
+    }
+
+    // ── Risk assessment ──
     let riskScore = 0;
     const risks = [];
     const positives = [];
 
-    const top10pct = parseFloat(supply.top10?.supplyPercent) || 0;
-    const top25pct = parseFloat(supply.top25?.supplyPercent) || 0;
-    const top50pct = parseFloat(supply.top50?.supplyPercent) || 0;
-    const top100pct = parseFloat(supply.top100?.supplyPercent) || 0;
+    const top1pct = holdersWithPct[0]?.pct || 0;
+    const top5pct = holdersWithPct.slice(0, 5).reduce((s, h) => s + h.pct, 0);
+    const top10pct = holdersWithPct.slice(0, 10).reduce((s, h) => s + h.pct, 0);
 
-    if (top10pct > 50) {
-      risks.push(`🚨 Top 10 holders own ${top10pct.toFixed(1)}% — extreme concentration`);
+    if (top1pct > 50) {
+      risks.push(`🚨 #1 wallet holds ${top1pct.toFixed(1)}% — extreme dominance`);
       riskScore += 35;
-    } else if (top10pct > 30) {
-      risks.push(`⚠️ Top 10 holders own ${top10pct.toFixed(1)}%`);
-      riskScore += 15;
+    } else if (top1pct > 20) {
+      risks.push(`⚠️ #1 wallet holds ${top1pct.toFixed(1)}%`);
+      riskScore += 20;
+    } else if (top1pct > 10) {
+      risks.push(`⚠️ #1 wallet holds ${top1pct.toFixed(1)}%`);
+      riskScore += 10;
+    }
+
+    if (top5pct > 50) {
+      risks.push(`🚨 Top 5 hold ${top5pct.toFixed(1)}% — heavy concentration`);
+      riskScore += 25;
+    } else if (top5pct > 30) {
+      risks.push(`⚠️ Top 5 hold ${top5pct.toFixed(1)}%`);
+      riskScore += 10;
     } else {
-      positives.push(`✅ Top 10 hold only ${top10pct.toFixed(1)}% — well spread`);
+      positives.push(`✅ Top 5 hold only ${top5pct.toFixed(1)}% — well distributed`);
     }
 
-    if (top50pct > 80) {
-      risks.push(`⚠️ Top 50 wallets control ${top50pct.toFixed(1)}% of supply`);
+    const whaleWallets = holdersWithPct.filter((h) => h.pct >= 5);
+    if (whaleWallets.length >= 3 && top10pct > 40) {
+      risks.push(`⚠️ ${whaleWallets.length} whale wallets (>5% each) — dump risk`);
       riskScore += 15;
     }
 
-    const whaleCount = dist.whales || 0;
-    if (whaleCount >= 5 && top10pct > 25) {
-      risks.push(`⚠️ ${whaleCount} whale wallets — coordinated dump risk`);
-      riskScore += 15;
-    }
-
-    if (total < 100) {
+    if (total > 0 && total < 100) {
       risks.push(`🚨 Only ${total} total holders — very thin`);
       riskScore += 20;
     } else if (total > 10000) {
@@ -1082,7 +1175,7 @@ bot.onText(/\/holders(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
       positives.push(`✅ ${total.toLocaleString()} holders`);
     }
 
-    // Holder trend (24h)
+    // 24h trend
     const h24 = change["24h"] || {};
     if (h24.change && h24.change < 0) {
       risks.push(`⚠️ Lost ${Math.abs(h24.change)} holders in 24h (${(h24.changePercent || 0).toFixed(2)}%)`);
@@ -1091,10 +1184,10 @@ bot.onText(/\/holders(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
       positives.push(`✅ +${h24.change} holders in 24h (+${(h24.changePercent || 0).toFixed(2)}%)`);
     }
 
-    // Airdrop heavy = suspicious
+    // Airdrop check
     const totalAcq = (acq.swap || 0) + (acq.transfer || 0) + (acq.airdrop || 0);
     if (totalAcq > 0 && acq.airdrop > 0) {
-      const airdropPct = ((acq.airdrop / totalAcq) * 100);
+      const airdropPct = (acq.airdrop / totalAcq) * 100;
       if (airdropPct > 30) {
         risks.push(`⚠️ ${airdropPct.toFixed(0)}% of holders from airdrops — possible wash`);
         riskScore += 10;
@@ -1109,56 +1202,59 @@ bot.onText(/\/holders(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
     else if (riskScore >= 10) { riskLevel = "LOW"; riskEmoji = "🟡"; }
     else { riskLevel = "HEALTHY"; riskEmoji = "🟢"; }
 
+    // ── Build message ──
     let text =
-      `👥 *${token.symbol} Holder Analysis (Solana)* ${riskEmoji}\n` +
-      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-      `*Total Holders:* ${total.toLocaleString()}\n\n`;
+      `👥 *Top Wallets for ${token.symbol}* ${riskEmoji}\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
 
-    // Supply concentration
-    text +=
-      `*Supply Concentration:*\n` +
-      `├ Top 10: ${top10pct.toFixed(2)}%\n` +
-      `├ Top 25: ${top25pct.toFixed(2)}%\n` +
-      `├ Top 50: ${top50pct.toFixed(2)}%\n` +
-      `├ Top 100: ${top100pct.toFixed(2)}%\n` +
-      `├ Top 250: ${(parseFloat(supply.top250?.supplyPercent) || 0).toFixed(2)}%\n` +
-      `└ Top 500: ${(parseFloat(supply.top500?.supplyPercent) || 0).toFixed(2)}%\n\n`;
-
-    // Holder distribution tiers
-    text += `*Holder Tiers:*\n`;
-    const tiers = [
-      ["🐋 Whales", dist.whales],
-      ["🦈 Sharks", dist.sharks],
-      ["🐬 Dolphins", dist.dolphins],
-      ["🐠 Fish", dist.fish],
-      ["🐙 Octopus", dist.octopus],
-      ["🦀 Crabs", dist.crabs],
-      ["🦐 Shrimps", dist.shrimps],
-    ];
-    for (let i = 0; i < tiers.length; i++) {
-      const [label, count] = tiers[i];
-      const connector = i < tiers.length - 1 ? "├" : "└";
-      text += `${connector} ${label}: ${(count || 0).toLocaleString()}\n`;
+    // Top 10 wallets with individual addresses
+    const display = holdersWithPct.slice(0, 10);
+    for (let i = 0; i < display.length; i++) {
+      const h = display[i];
+      const addr = h.address;
+      const short = `${addr.slice(0, 3)}...${addr.slice(-4)}`;
+      const pct = h.pct.toFixed(1);
+      const emoji = tierEmoji(h.pct);
+      text += `*#${i + 1}* \`${short}\` [${pct}%] ${emoji}\n`;
     }
 
-    // Acquisition methods
-    text += `\n*How Holders Acquired:*\n` +
-      `├ 🔄 Swap: ${(acq.swap || 0).toLocaleString()}\n` +
-      `├ 📤 Transfer: ${(acq.transfer || 0).toLocaleString()}\n` +
-      `└ 🎁 Airdrop: ${(acq.airdrop || 0).toLocaleString()}\n`;
+    // Concentration summary
+    text += `\n*Concentration:*\n` +
+      `├ Top 5: ${top5pct.toFixed(1)}%\n` +
+      `├ Top 10: ${top10pct.toFixed(1)}%\n` +
+      `└ Top 20: ${holdersWithPct.slice(0, 20).reduce((s, h) => s + h.pct, 0).toFixed(1)}%\n`;
 
-    // Holder trend
-    const intervals = ["5min", "1h", "6h", "24h", "3d", "7d", "30d"];
-    const trendParts = [];
-    for (const iv of intervals) {
-      const c = change[iv];
-      if (c && c.change !== undefined && c.change !== null) {
-        const sign = c.change >= 0 ? "+" : "";
-        trendParts.push(`${iv}: ${sign}${c.change}`);
+    // Moralis extras (if available)
+    if (total > 0) {
+      text += `\n*Total Holders:* ${total.toLocaleString()}\n`;
+
+      // Tiers
+      const tierList = [
+        ["🐋", dist.whales], ["🦈", dist.sharks], ["🐬", dist.dolphins],
+        ["🐠", dist.fish], ["🐙", dist.octopus], ["🦀", dist.crabs], ["🦐", dist.shrimps],
+      ].filter(([, c]) => c > 0);
+      if (tierList.length) {
+        text += tierList.map(([e, c]) => `${e}${c}`).join(" · ") + "\n";
       }
-    }
-    if (trendParts.length) {
-      text += `\n*Holder Trend:*\n${trendParts.join(" | ")}\n`;
+
+      // Acquisition
+      if (totalAcq > 0) {
+        text += `\n*Acquired via:* 🔄 ${(acq.swap || 0).toLocaleString()} swap · 📤 ${(acq.transfer || 0).toLocaleString()} transfer · 🎁 ${(acq.airdrop || 0).toLocaleString()} airdrop\n`;
+      }
+
+      // Trend (compact)
+      const intervals = ["1h", "6h", "24h", "7d", "30d"];
+      const trendParts = [];
+      for (const iv of intervals) {
+        const c = change[iv];
+        if (c && c.change !== undefined && c.change !== null) {
+          const sign = c.change >= 0 ? "+" : "";
+          trendParts.push(`${iv}: ${sign}${c.change}`);
+        }
+      }
+      if (trendParts.length) {
+        text += `\n*Trend:* ${trendParts.join(" | ")}\n`;
+      }
     }
 
     // Signals
