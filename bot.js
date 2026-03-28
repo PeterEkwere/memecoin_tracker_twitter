@@ -1047,10 +1047,10 @@ bot.onText(/\/holders(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
     const risks = [];
     const positives = [];
 
-    const top10pct = supply.top10 || 0;
-    const top25pct = supply.top25 || 0;
-    const top50pct = supply.top50 || 0;
-    const top100pct = supply.top100 || 0;
+    const top10pct = parseFloat(supply.top10) || 0;
+    const top25pct = parseFloat(supply.top25) || 0;
+    const top50pct = parseFloat(supply.top50) || 0;
+    const top100pct = parseFloat(supply.top100) || 0;
 
     if (top10pct > 50) {
       risks.push(`🚨 Top 10 holders own ${top10pct.toFixed(1)}% — extreme concentration`);
@@ -1121,7 +1121,7 @@ bot.onText(/\/holders(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
       `├ Top 25: ${top25pct.toFixed(2)}%\n` +
       `├ Top 50: ${top50pct.toFixed(2)}%\n` +
       `├ Top 100: ${top100pct.toFixed(2)}%\n` +
-      `└ Top 500: ${(supply.top500 || 0).toFixed(2)}%\n\n`;
+      `└ Top 500: ${(parseFloat(supply.top500) || 0).toFixed(2)}%\n\n`;
 
     // Holder distribution tiers
     text += `*Holder Tiers:*\n`;
