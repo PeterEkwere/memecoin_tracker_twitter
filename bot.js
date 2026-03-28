@@ -227,7 +227,7 @@ async function fetchSnipers(tokenAddress, chain) {
 }
 
 /**
- * Fetch top holders for a token via Moralis.
+ * Fetch top holders for a token via Moralis (EVM).
  * Returns { totalSupply, holders[], error? }
  */
 async function fetchHolders(tokenAddress, chain) {
@@ -251,6 +251,29 @@ async function fetchHolders(tokenAddress, chain) {
     totalSupply: data.totalSupply || "0",
     holders: data.result || [],
   };
+}
+
+/**
+ * Fetch holder stats for a Solana token via Moralis Solana Gateway.
+ * Returns aggregate data: totalHolders, distribution tiers, supply concentration, acquisition methods.
+ */
+function fetchSolanaHolders(tokenAddress) {
+  return new Promise((resolve) => {
+    const opts = {
+      hostname: "solana-gateway.moralis.io",
+      path: `/token/mainnet/holders/${tokenAddress}`,
+      headers: { "X-API-Key": MORALIS_API_KEY, Accept: "application/json" },
+    };
+    https
+      .get(opts, (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          try { resolve(JSON.parse(data)); } catch { resolve(null); }
+        });
+      })
+      .on("error", () => resolve(null));
+  });
 }
 
 // ── Breakout calculation ───────────────────────────────────────────
@@ -372,8 +395,8 @@ bot.onText(/\/help(@\w+)?(\s|$)/, (msg) => {
       `_Full holder distribution analysis._\n` +
       `Shows top 10 holders with labels (exchanges, contracts, burn addresses), concentration risk (top 5/10/20), whale vs retail breakdown, and exchange presence.\n` +
       `Use this to check if a token is well-distributed or if a few wallets control everything.\n` +
-      `Example: /holders PEPE\n` +
-      `Note: EVM chains only (ETH, BSC, Base, etc.)\n\n` +
+      `Example: /holders PEPE or /holders WIF\n` +
+      `Supports EVM (ETH, BSC, Base, etc.) & Solana\n\n` +
 
       `🐦 */social* — _Coming soon (needs Twitter API)_\n` +
       `🔍 */trust* — _Coming soon (needs Twitter API)_\n\n` +
@@ -996,12 +1019,162 @@ bot.onText(/\/holders(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
   }
 
   const evmChains = ["ethereum", "bsc", "arbitrum", "polygon", "base", "optimism", "avalanche"];
-  if (!evmChains.includes(token.chain)) {
+  const isSolana = token.chain === "solana";
+
+  if (!isSolana && !evmChains.includes(token.chain)) {
     return bot.sendMessage(
       msg.chat.id,
-      `Holder analysis supports EVM chains only.\n${token.symbol} is on ${token.chain}.`
+      `Holder analysis supports EVM & Solana chains only.\n${token.symbol} is on ${token.chain}.`
     );
   }
+
+  // ── Solana path ──
+  if (isSolana) {
+    const sol = await fetchSolanaHolders(token.address);
+
+    if (!sol || sol.error || sol.message) {
+      return bot.sendMessage(msg.chat.id, `Error: ${sol?.message || sol?.error || "Failed to fetch Solana holders"}`);
+    }
+
+    const total = sol.totalHolders || 0;
+    const dist = sol.holderDistribution || {};
+    const supply = sol.holderSupply || {};
+    const acq = sol.holdersByAcquisition || {};
+    const change = sol.holderChange || {};
+
+    // ── Risk assessment for Solana ──
+    let riskScore = 0;
+    const risks = [];
+    const positives = [];
+
+    const top10pct = supply.top10 || 0;
+    const top25pct = supply.top25 || 0;
+    const top50pct = supply.top50 || 0;
+    const top100pct = supply.top100 || 0;
+
+    if (top10pct > 50) {
+      risks.push(`🚨 Top 10 holders own ${top10pct.toFixed(1)}% — extreme concentration`);
+      riskScore += 35;
+    } else if (top10pct > 30) {
+      risks.push(`⚠️ Top 10 holders own ${top10pct.toFixed(1)}%`);
+      riskScore += 15;
+    } else {
+      positives.push(`✅ Top 10 hold only ${top10pct.toFixed(1)}% — well spread`);
+    }
+
+    if (top50pct > 80) {
+      risks.push(`⚠️ Top 50 wallets control ${top50pct.toFixed(1)}% of supply`);
+      riskScore += 15;
+    }
+
+    const whaleCount = dist.whales || 0;
+    if (whaleCount >= 5 && top10pct > 25) {
+      risks.push(`⚠️ ${whaleCount} whale wallets — coordinated dump risk`);
+      riskScore += 15;
+    }
+
+    if (total < 100) {
+      risks.push(`🚨 Only ${total} total holders — very thin`);
+      riskScore += 20;
+    } else if (total > 10000) {
+      positives.push(`✅ ${total.toLocaleString()} total holders — strong community`);
+    } else if (total > 1000) {
+      positives.push(`✅ ${total.toLocaleString()} holders`);
+    }
+
+    // Holder trend (24h)
+    const h24 = change["24h"] || {};
+    if (h24.change && h24.change < 0) {
+      risks.push(`⚠️ Lost ${Math.abs(h24.change)} holders in 24h (${(h24.changePercent || 0).toFixed(2)}%)`);
+      riskScore += 10;
+    } else if (h24.change && h24.change > 0) {
+      positives.push(`✅ +${h24.change} holders in 24h (+${(h24.changePercent || 0).toFixed(2)}%)`);
+    }
+
+    // Airdrop heavy = suspicious
+    const totalAcq = (acq.swap || 0) + (acq.transfer || 0) + (acq.airdrop || 0);
+    if (totalAcq > 0 && acq.airdrop > 0) {
+      const airdropPct = ((acq.airdrop / totalAcq) * 100);
+      if (airdropPct > 30) {
+        risks.push(`⚠️ ${airdropPct.toFixed(0)}% of holders from airdrops — possible wash`);
+        riskScore += 10;
+      }
+    }
+
+    riskScore = Math.min(riskScore, 100);
+
+    let riskLevel, riskEmoji;
+    if (riskScore >= 50) { riskLevel = "HIGH"; riskEmoji = "🔴"; }
+    else if (riskScore >= 25) { riskLevel = "MODERATE"; riskEmoji = "🟠"; }
+    else if (riskScore >= 10) { riskLevel = "LOW"; riskEmoji = "🟡"; }
+    else { riskLevel = "HEALTHY"; riskEmoji = "🟢"; }
+
+    let text =
+      `👥 *${token.symbol} Holder Analysis (Solana)* ${riskEmoji}\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `*Total Holders:* ${total.toLocaleString()}\n\n`;
+
+    // Supply concentration
+    text +=
+      `*Supply Concentration:*\n` +
+      `├ Top 10: ${top10pct.toFixed(2)}%\n` +
+      `├ Top 25: ${top25pct.toFixed(2)}%\n` +
+      `├ Top 50: ${top50pct.toFixed(2)}%\n` +
+      `├ Top 100: ${top100pct.toFixed(2)}%\n` +
+      `└ Top 500: ${(supply.top500 || 0).toFixed(2)}%\n\n`;
+
+    // Holder distribution tiers
+    text += `*Holder Tiers:*\n`;
+    const tiers = [
+      ["🐋 Whales", dist.whales],
+      ["🦈 Sharks", dist.sharks],
+      ["🐬 Dolphins", dist.dolphins],
+      ["🐠 Fish", dist.fish],
+      ["🐙 Octopus", dist.octopus],
+      ["🦀 Crabs", dist.crabs],
+      ["🦐 Shrimps", dist.shrimps],
+    ];
+    for (let i = 0; i < tiers.length; i++) {
+      const [label, count] = tiers[i];
+      const connector = i < tiers.length - 1 ? "├" : "└";
+      text += `${connector} ${label}: ${(count || 0).toLocaleString()}\n`;
+    }
+
+    // Acquisition methods
+    text += `\n*How Holders Acquired:*\n` +
+      `├ 🔄 Swap: ${(acq.swap || 0).toLocaleString()}\n` +
+      `├ 📤 Transfer: ${(acq.transfer || 0).toLocaleString()}\n` +
+      `└ 🎁 Airdrop: ${(acq.airdrop || 0).toLocaleString()}\n`;
+
+    // Holder trend
+    const intervals = ["5min", "1h", "6h", "24h", "3d", "7d", "30d"];
+    const trendParts = [];
+    for (const iv of intervals) {
+      const c = change[iv];
+      if (c && c.change !== undefined && c.change !== null) {
+        const sign = c.change >= 0 ? "+" : "";
+        trendParts.push(`${iv}: ${sign}${c.change}`);
+      }
+    }
+    if (trendParts.length) {
+      text += `\n*Holder Trend:*\n${trendParts.join(" | ")}\n`;
+    }
+
+    // Signals
+    if (risks.length || positives.length) {
+      text += `\n*Signals:*\n`;
+      for (const r of risks) text += `${r}\n`;
+      for (const p of positives) text += `${p}\n`;
+    }
+
+    text +=
+      `\n${riskEmoji} *Holder Risk: ${riskLevel}* (${riskScore}/100)\n\n` +
+      `🕐 ${utcNow()}`;
+
+    return bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
+  }
+
+  // ── EVM path ──
 
   const data = await fetchHolders(token.address, token.chain);
 
