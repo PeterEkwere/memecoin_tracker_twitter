@@ -1882,16 +1882,16 @@ function ageStr(ts) {
 
 function formatBonding(tokens, threshold) {
   if (!tokens.length) return "No tokens above threshold.";
-  let txt = `🔥 *ABOUT TO BOND* — ${threshold}%+\n━━━━━━━━━━━━━━━━━━━━\n`;
+  let txt = `🔥 ABOUT TO BOND — ${threshold}%+\n━━━━━━━━━━━━━━━━━━━━\n`;
   tokens.forEach((t, i) => {
     const pct = parseFloat(t.bondingCurveProgress || 0);
-    const sym = escapeMd(t.symbol || "?");
+    const sym = (t.symbol || "?").replace(/[\r\n]/g, "");
     const sol = parseFloat(t.liquidity || 0);
     const mc = parseFloat(t.fullyDilutedValuation || t.marketCap || 0);
     txt +=
-      `\n*${i + 1}. ${sym}*  ${progressBar(pct)} ${pct.toFixed(0)}%\n` +
+      `\n${i + 1}. ${sym}  ${progressBar(pct)} ${pct.toFixed(0)}%\n` +
       `  💧 ${fmtNum(sol, 1)} SOL · MC $${fmtNum(mc, 0)} · age ${ageStr(t.createdAt)}\n` +
-      `  \`${t.tokenAddress}\`\n`;
+      `  ${t.tokenAddress}\n`;
   });
   txt += `\n━━━━━━━━━━━━━━━━━━━━\nupdated ${new Date().toISOString().slice(11, 19)} UTC`;
   return txt;
@@ -1905,7 +1905,7 @@ bot.onText(/\/bonding(?:@\w+)?(?:\s+(\d+))?$/, async (msg, match) => {
     const list = (data?.result || data || []).filter((t) => parseFloat(t.bondingCurveProgress || 0) >= threshold);
     list.sort((a, b) => parseFloat(b.bondingCurveProgress || 0) - parseFloat(a.bondingCurveProgress || 0));
     const top = list.slice(0, threshold >= 80 ? 20 : 30);
-    bot.sendMessage(msg.chat.id, formatBonding(top, threshold), { parse_mode: "Markdown" });
+    bot.sendMessage(msg.chat.id, formatBonding(top, threshold));
   } catch (e) {
     bot.sendMessage(msg.chat.id, `❌ ${e.message}`);
   }
