@@ -1,9 +1,6 @@
 .env
-__pycache__/
-*.pyc
-*.pyo
-data/cache/
-data/watchlist.json
 .DS_Store
-venv/
-.venv/
+node_modules/
+wallet.json
+trades.json
+bonding_watch.json

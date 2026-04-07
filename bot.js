@@ -412,7 +412,23 @@ bot.onText(/\/start(@\w+)?(\s|$)/, (msg) => {
 bot.onText(/\/help(@\w+)?(\s|$)/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    `🐸 *Meme Intelligence Bot — Commands*\n` +
+    `💼 *WALLET & TRADING*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `/wallet — Show your Solana address + SOL/USDC balance\n` +
+      `/balance — List all SPL tokens you hold with $ values\n` +
+      `/positions — Holdings with PnL vs entry price\n` +
+      `/quote <mint> <sol> — Dry-run a buy, no execution\n` +
+      `/buy <mint> <sol> — Buy token with SOL via Jupiter\n` +
+      `/sell <mint> <pct> — Sell N% of a token back to SOL\n` +
+      `/slippage <bps> — Set slippage (default 500 = 5%)\n` +
+      `/export — DM your private key (danger)\n\n` +
+      `🚀 *PUMP.FUN BONDING*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `/bonding — Top tokens >80% bonded\n` +
+      `/bonding <pct> — Custom threshold (e.g. /bonding 50)\n` +
+      `/bonding_watch — Alert when any token crosses 80%\n` +
+      `/bonding_stop — Stop watch alerts\n\n` +
+      `🐸 *Meme Intelligence Bot — Commands*\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
 
       `📊 */market <token>*\n` +
@@ -1447,6 +1463,502 @@ bot.onText(/\/holders(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
   bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
 });
 
+// ════════════════════════════════════════════════════════════════════
+// WALLET + JUPITER TRADING + PUMP.FUN BONDING SCANNER
+// ════════════════════════════════════════════════════════════════════
+
+const fs = require("fs");
+const path = require("path");
+const {
+  Connection,
+  Keypair,
+  PublicKey,
+  VersionedTransaction,
+  LAMPORTS_PER_SOL,
+} = require("@solana/web3.js");
+const bs58 = require("bs58").default || require("bs58");
+
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+const connection = new Connection(HELIUS_RPC, "confirmed");
+
+const WALLET_FILE = path.join(__dirname, "wallet.json");
+const TRADES_FILE = path.join(__dirname, "trades.json");
+const WATCH_FILE = path.join(__dirname, "bonding_watch.json");
+
+// ── Persistent JSON helpers ────────────────────────────────────────
+function loadJson(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; }
+}
+function saveJson(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+// ── Wallet (single user, hardcoded use) ────────────────────────────
+let walletState = loadJson(WALLET_FILE, null);
+if (!walletState) {
+  const kp = Keypair.generate();
+  walletState = {
+    publicKey: kp.publicKey.toBase58(),
+    secretKey: bs58.encode(kp.secretKey),
+    slippageBps: 500,
+  };
+  saveJson(WALLET_FILE, walletState);
+  console.log(`✨ New wallet generated: ${walletState.publicKey}`);
+}
+function getKeypair() {
+  return Keypair.fromSecretKey(bs58.decode(walletState.secretKey));
+}
+
+// ── Generic JSON fetch (POST/GET) ──────────────────────────────────
+function httpJson(url, options = {}) {
+  return new Promise((resolve) => {
+    const lib = require("https");
+    const u = new URL(url);
+    const req = lib.request(
+      {
+        hostname: u.hostname,
+        path: u.pathname + u.search,
+        method: options.method || "GET",
+        headers: options.headers || {},
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          try { resolve(JSON.parse(data)); } catch { resolve(null); }
+        });
+      }
+    );
+    req.on("error", () => resolve(null));
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
+
+// ── Jupiter price + quote + swap ───────────────────────────────────
+async function jupPrice(mints) {
+  const ids = Array.isArray(mints) ? mints.join(",") : mints;
+  const r = await httpJson(`https://lite-api.jup.ag/price/v2?ids=${ids}`);
+  return r?.data || {};
+}
+
+async function jupQuote(inputMint, outputMint, amount, slippageBps) {
+  const url = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}&onlyDirectRoutes=false`;
+  return await httpJson(url);
+}
+
+async function jupSwap(quoteResponse, userPublicKey) {
+  const body = JSON.stringify({
+    quoteResponse,
+    userPublicKey,
+    wrapAndUnwrapSol: true,
+    dynamicComputeUnitLimit: true,
+    prioritizationFeeLamports: "auto",
+  });
+  return await httpJson("https://quote-api.jup.ag/v6/swap", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+    body,
+  });
+}
+
+async function executeSwap(quote) {
+  const kp = getKeypair();
+  const swapRes = await jupSwap(quote, kp.publicKey.toBase58());
+  if (!swapRes?.swapTransaction) throw new Error("No swap transaction returned");
+  const txBuf = Buffer.from(swapRes.swapTransaction, "base64");
+  const tx = VersionedTransaction.deserialize(txBuf);
+  tx.sign([kp]);
+  const sig = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    maxRetries: 3,
+  });
+  return sig;
+}
+
+// ── Token metadata (symbol/decimals) via Helius ────────────────────
+const tokenMetaCache = {};
+async function getTokenMeta(mint) {
+  if (tokenMetaCache[mint]) return tokenMetaCache[mint];
+  const body = JSON.stringify({
+    jsonrpc: "2.0", id: 1, method: "getAsset", params: { id: mint },
+  });
+  const res = await httpJson(HELIUS_RPC, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+    body,
+  });
+  const r = res?.result;
+  const meta = {
+    symbol: r?.content?.metadata?.symbol || r?.token_info?.symbol || "?",
+    name: r?.content?.metadata?.name || "?",
+    decimals: r?.token_info?.decimals ?? 9,
+  };
+  tokenMetaCache[mint] = meta;
+  return meta;
+}
+
+// ── Balance helpers ────────────────────────────────────────────────
+async function getSolBalance() {
+  const lamports = await connection.getBalance(new PublicKey(walletState.publicKey));
+  return lamports / LAMPORTS_PER_SOL;
+}
+
+async function getTokenAccounts() {
+  const body = JSON.stringify({
+    jsonrpc: "2.0", id: 1, method: "getTokenAccountsByOwner",
+    params: [walletState.publicKey, { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" }, { encoding: "jsonParsed" }],
+  });
+  const res = await httpJson(HELIUS_RPC, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+    body,
+  });
+  const accts = res?.result?.value || [];
+  return accts
+    .map((a) => {
+      const info = a.account.data.parsed.info;
+      return {
+        mint: info.mint,
+        amount: parseFloat(info.tokenAmount.uiAmountString || "0"),
+        decimals: info.tokenAmount.decimals,
+      };
+    })
+    .filter((t) => t.amount > 0);
+}
+
+// ── Validation ─────────────────────────────────────────────────────
+function isValidMint(s) {
+  try {
+    const k = new PublicKey(s);
+    return k.toBase58() === s && s.length >= 32;
+  } catch { return false; }
+}
+
+// ── Trades store (for PnL) ─────────────────────────────────────────
+function recordTrade(t) {
+  const trades = loadJson(TRADES_FILE, []);
+  trades.push({ ...t, ts: Date.now() });
+  saveJson(TRADES_FILE, trades);
+}
+function avgEntryFor(mint) {
+  const trades = loadJson(TRADES_FILE, []).filter((t) => t.mint === mint && t.side === "buy");
+  if (!trades.length) return null;
+  let totSol = 0, totTok = 0;
+  for (const t of trades) { totSol += t.solAmount; totTok += t.tokenAmount; }
+  return { solSpent: totSol, tokensBought: totTok, avgPriceSol: totSol / totTok };
+}
+
+// ── Format helpers ─────────────────────────────────────────────────
+function fmtNum(n, d = 4) {
+  if (n === null || n === undefined || isNaN(n)) return "?";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(2) + "K";
+  return Number(n).toFixed(d);
+}
+function shortMint(m) { return m.slice(0, 4) + "..." + m.slice(-4); }
+function escapeMd(s) { return String(s).replace(/[_*`\[\]]/g, "\\$&"); }
+
+// ════════════════════════════════════════════════════════════════════
+// COMMANDS — WALLET
+// ════════════════════════════════════════════════════════════════════
+
+bot.onText(/\/wallet(@\w+)?(\s|$)/, async (msg) => {
+  try {
+    const sol = await getSolBalance();
+    const accts = await getTokenAccounts();
+    const usdc = accts.find((a) => a.mint === USDC_MINT);
+    const prices = await jupPrice([SOL_MINT]);
+    const solPrice = parseFloat(prices[SOL_MINT]?.price || 0);
+    const text =
+      `💼 *Your Wallet*\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `\`${walletState.publicKey}\`\n\n` +
+      `*SOL:* ${sol.toFixed(4)}  ($${(sol * solPrice).toFixed(2)})\n` +
+      `*USDC:* ${(usdc?.amount || 0).toFixed(2)}\n\n` +
+      `Send SOL or USDC to the address above to fund.\n` +
+      `Slippage: ${walletState.slippageBps} bps`;
+    bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, `Error: ${e.message}`);
+  }
+});
+
+bot.onText(/\/balance(@\w+)?(\s|$)/, async (msg) => {
+  try {
+    const sol = await getSolBalance();
+    const accts = await getTokenAccounts();
+    const mints = [SOL_MINT, ...accts.map((a) => a.mint)];
+    const prices = await jupPrice(mints);
+    const solPrice = parseFloat(prices[SOL_MINT]?.price || 0);
+    let totalUsd = sol * solPrice;
+    let lines = [`💰 *Portfolio*`, `━━━━━━━━━━━━━━━━━━━━`, `*SOL* ${sol.toFixed(4)} · $${(sol * solPrice).toFixed(2)}`];
+    for (const a of accts) {
+      const meta = await getTokenMeta(a.mint);
+      const px = parseFloat(prices[a.mint]?.price || 0);
+      const usd = a.amount * px;
+      totalUsd += usd;
+      lines.push(`*${escapeMd(meta.symbol)}* ${fmtNum(a.amount)} · $${usd.toFixed(2)}\n  \`${a.mint}\``);
+    }
+    lines.push(`━━━━━━━━━━━━━━━━━━━━`, `*Total:* $${totalUsd.toFixed(2)}`);
+    bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, `Error: ${e.message}`);
+  }
+});
+
+bot.onText(/\/positions(@\w+)?(\s|$)/, async (msg) => {
+  try {
+    const accts = await getTokenAccounts();
+    if (!accts.length) return bot.sendMessage(msg.chat.id, "No positions.");
+    const mints = accts.map((a) => a.mint).concat(SOL_MINT);
+    const prices = await jupPrice(mints);
+    const solPrice = parseFloat(prices[SOL_MINT]?.price || 0);
+    let lines = [`📈 *Positions*`, `━━━━━━━━━━━━━━━━━━━━`];
+    for (const a of accts) {
+      const meta = await getTokenMeta(a.mint);
+      const px = parseFloat(prices[a.mint]?.price || 0);
+      const entry = avgEntryFor(a.mint);
+      const curUsd = a.amount * px;
+      let pnlStr = "_no entry_";
+      if (entry) {
+        const costUsd = entry.solSpent * solPrice;
+        const pnlPct = ((curUsd - costUsd) / costUsd) * 100;
+        const arrow = pnlPct >= 0 ? "🟢" : "🔴";
+        pnlStr = `${arrow} ${pnlPct.toFixed(1)}% (cost $${costUsd.toFixed(2)} → $${curUsd.toFixed(2)})`;
+      }
+      lines.push(`*${escapeMd(meta.symbol)}* ${fmtNum(a.amount)}\n  \`${a.mint}\`\n  ${pnlStr}`);
+    }
+    bot.sendMessage(msg.chat.id, lines.join("\n\n"), { parse_mode: "Markdown" });
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, `Error: ${e.message}`);
+  }
+});
+
+bot.onText(/\/slippage(?:@\w+)?(?:\s+(\d+))?/, (msg, match) => {
+  const bps = match && match[1] ? parseInt(match[1]) : null;
+  if (!bps || bps < 1 || bps > 5000) {
+    return bot.sendMessage(msg.chat.id, `Current slippage: ${walletState.slippageBps} bps\nUsage: /slippage 500 (= 5%)`);
+  }
+  walletState.slippageBps = bps;
+  saveJson(WALLET_FILE, walletState);
+  bot.sendMessage(msg.chat.id, `✅ Slippage set to ${bps} bps (${(bps / 100).toFixed(2)}%)`);
+});
+
+bot.onText(/\/export(@\w+)?(\s|$)/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    `⚠️ *PRIVATE KEY — DO NOT SHARE*\n\n\`${walletState.secretKey}\`\n\nAnyone with this key controls your funds.`,
+    { parse_mode: "Markdown" }
+  );
+});
+
+// ── Quote / Buy / Sell ─────────────────────────────────────────────
+
+async function doQuote(inputMint, outputMint, amount, slippageBps) {
+  const q = await jupQuote(inputMint, outputMint, amount, slippageBps);
+  if (!q || q.error) throw new Error(q?.error || "No route");
+  return q;
+}
+
+bot.onText(/\/quote(?:@\w+)?(?:\s+(\S+)\s+(\S+))?/, async (msg, match) => {
+  if (!match || !match[1] || !match[2]) {
+    return bot.sendMessage(msg.chat.id, "Usage: `/quote <mint> <sol_amount>`", { parse_mode: "Markdown" });
+  }
+  const mint = match[1].trim();
+  const solAmt = parseFloat(match[2]);
+  if (!isValidMint(mint)) return bot.sendMessage(msg.chat.id, "❌ Invalid mint address.");
+  if (!solAmt || solAmt <= 0) return bot.sendMessage(msg.chat.id, "❌ Invalid SOL amount.");
+  try {
+    const lamports = Math.floor(solAmt * LAMPORTS_PER_SOL);
+    const q = await doQuote(SOL_MINT, mint, lamports, walletState.slippageBps);
+    const meta = await getTokenMeta(mint);
+    const out = parseFloat(q.outAmount) / 10 ** meta.decimals;
+    const minOut = parseFloat(q.otherAmountThreshold) / 10 ** meta.decimals;
+    const impact = parseFloat(q.priceImpactPct || 0) * 100;
+    bot.sendMessage(
+      msg.chat.id,
+      `📋 *Quote*\n━━━━━━━━━━━━━━━━━━━━\n` +
+        `*${escapeMd(meta.symbol)}* (${escapeMd(meta.name)})\n` +
+        `\`${mint}\`\n\n` +
+        `Pay: *${solAmt} SOL*\n` +
+        `Receive: *${fmtNum(out)} ${escapeMd(meta.symbol)}*\n` +
+        `Min (after slip): ${fmtNum(minOut)}\n` +
+        `Price impact: ${impact.toFixed(3)}%\n` +
+        `Route: ${q.routePlan?.length || 1} hop(s)`,
+      { parse_mode: "Markdown" }
+    );
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, `❌ ${e.message}`);
+  }
+});
+
+bot.onText(/\/buy(?:@\w+)?(?:\s+(\S+)\s+(\S+))?/, async (msg, match) => {
+  if (!match || !match[1] || !match[2]) {
+    return bot.sendMessage(msg.chat.id, "Usage: `/buy <mint> <sol_amount>`", { parse_mode: "Markdown" });
+  }
+  const mint = match[1].trim();
+  const solAmt = parseFloat(match[2]);
+  if (!isValidMint(mint)) return bot.sendMessage(msg.chat.id, "❌ Invalid mint address.");
+  if (!solAmt || solAmt <= 0) return bot.sendMessage(msg.chat.id, "❌ Invalid SOL amount.");
+  try {
+    const balSol = await getSolBalance();
+    if (balSol < solAmt + 0.005) return bot.sendMessage(msg.chat.id, `❌ Not enough SOL. Have ${balSol.toFixed(4)}`);
+    bot.sendMessage(msg.chat.id, `⏳ Buying...`);
+    const lamports = Math.floor(solAmt * LAMPORTS_PER_SOL);
+    const q = await doQuote(SOL_MINT, mint, lamports, walletState.slippageBps);
+    const meta = await getTokenMeta(mint);
+    const tokensOut = parseFloat(q.outAmount) / 10 ** meta.decimals;
+    const sig = await executeSwap(q);
+    recordTrade({ side: "buy", mint, symbol: meta.symbol, solAmount: solAmt, tokenAmount: tokensOut, sig });
+    bot.sendMessage(
+      msg.chat.id,
+      `✅ *Bought* ${fmtNum(tokensOut)} *${escapeMd(meta.symbol)}* for ${solAmt} SOL\n[tx](https://solscan.io/tx/${sig})`,
+      { parse_mode: "Markdown", disable_web_page_preview: true }
+    );
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, `❌ Buy failed: ${e.message}`);
+  }
+});
+
+bot.onText(/\/sell(?:@\w+)?(?:\s+(\S+)\s+(\S+))?/, async (msg, match) => {
+  if (!match || !match[1] || !match[2]) {
+    return bot.sendMessage(msg.chat.id, "Usage: `/sell <mint> <percent>`\nExample: `/sell <mint> 100`", { parse_mode: "Markdown" });
+  }
+  const mint = match[1].trim();
+  const pct = parseFloat(match[2]);
+  if (!isValidMint(mint)) return bot.sendMessage(msg.chat.id, "❌ Invalid mint address.");
+  if (!pct || pct <= 0 || pct > 100) return bot.sendMessage(msg.chat.id, "❌ Percent must be 1–100");
+  try {
+    const accts = await getTokenAccounts();
+    const holding = accts.find((a) => a.mint === mint);
+    if (!holding || holding.amount <= 0) return bot.sendMessage(msg.chat.id, "❌ You don't hold this token.");
+    const sellAmount = holding.amount * (pct / 100);
+    const rawAmount = Math.floor(sellAmount * 10 ** holding.decimals);
+    bot.sendMessage(msg.chat.id, `⏳ Selling ${pct}%...`);
+    const q = await doQuote(mint, SOL_MINT, rawAmount, walletState.slippageBps);
+    const meta = await getTokenMeta(mint);
+    const solOut = parseFloat(q.outAmount) / LAMPORTS_PER_SOL;
+    const sig = await executeSwap(q);
+    recordTrade({ side: "sell", mint, symbol: meta.symbol, solAmount: solOut, tokenAmount: sellAmount, sig });
+    bot.sendMessage(
+      msg.chat.id,
+      `✅ *Sold* ${fmtNum(sellAmount)} *${escapeMd(meta.symbol)}* for ${solOut.toFixed(4)} SOL\n[tx](https://solscan.io/tx/${sig})`,
+      { parse_mode: "Markdown", disable_web_page_preview: true }
+    );
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, `❌ Sell failed: ${e.message}`);
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// PUMP.FUN BONDING SCANNER (Moralis)
+// ════════════════════════════════════════════════════════════════════
+
+async function fetchBondingTokens(limit = 100) {
+  const url = `https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/bonding?limit=${limit}`;
+  return await httpJson(url, {
+    method: "GET",
+    headers: { "X-API-Key": MORALIS_API_KEY, Accept: "application/json" },
+  });
+}
+
+function progressBar(pct) {
+  const full = Math.round(pct / 10);
+  return "▰".repeat(full) + "▱".repeat(10 - full);
+}
+
+function ageStr(ts) {
+  if (!ts) return "?";
+  const ms = Date.now() - new Date(ts).getTime();
+  const m = Math.floor(ms / 60000);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  return `${Math.floor(h / 24)}d`;
+}
+
+function formatBonding(tokens, threshold) {
+  if (!tokens.length) return "No tokens above threshold.";
+  let txt = `🔥 *ABOUT TO BOND* — ${threshold}%+\n━━━━━━━━━━━━━━━━━━━━\n`;
+  tokens.forEach((t, i) => {
+    const pct = parseFloat(t.bondingCurveProgress || 0);
+    const sym = escapeMd(t.symbol || "?");
+    const sol = parseFloat(t.liquidity || 0);
+    const mc = parseFloat(t.fullyDilutedValuation || t.marketCap || 0);
+    txt +=
+      `\n*${i + 1}. ${sym}*  ${progressBar(pct)} ${pct.toFixed(0)}%\n` +
+      `  💧 ${fmtNum(sol, 1)} SOL · MC $${fmtNum(mc, 0)} · age ${ageStr(t.createdAt)}\n` +
+      `  \`${t.tokenAddress}\`\n`;
+  });
+  txt += `\n━━━━━━━━━━━━━━━━━━━━\nupdated ${new Date().toISOString().slice(11, 19)} UTC`;
+  return txt;
+}
+
+bot.onText(/\/bonding(?:@\w+)?(?:\s+(\d+))?$/, async (msg, match) => {
+  const threshold = match && match[1] ? parseInt(match[1]) : 80;
+  bot.sendMessage(msg.chat.id, `Scanning pump.fun bonding curves >${threshold}%...`);
+  try {
+    const data = await fetchBondingTokens(100);
+    const list = (data?.result || data || []).filter((t) => parseFloat(t.bondingCurveProgress || 0) >= threshold);
+    list.sort((a, b) => parseFloat(b.bondingCurveProgress || 0) - parseFloat(a.bondingCurveProgress || 0));
+    const top = list.slice(0, threshold >= 80 ? 20 : 30);
+    bot.sendMessage(msg.chat.id, formatBonding(top, threshold), { parse_mode: "Markdown" });
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, `❌ ${e.message}`);
+  }
+});
+
+// ── Bonding watcher ────────────────────────────────────────────────
+let watchState = loadJson(WATCH_FILE, { chats: [], crossed: {} });
+
+bot.onText(/\/bonding_watch(@\w+)?(\s|$)/, (msg) => {
+  if (!watchState.chats.includes(msg.chat.id)) {
+    watchState.chats.push(msg.chat.id);
+    saveJson(WATCH_FILE, watchState);
+  }
+  bot.sendMessage(msg.chat.id, "👀 Watching pump.fun. You'll be alerted when any token crosses 80%.");
+});
+
+bot.onText(/\/bonding_stop(@\w+)?(\s|$)/, (msg) => {
+  watchState.chats = watchState.chats.filter((c) => c !== msg.chat.id);
+  saveJson(WATCH_FILE, watchState);
+  bot.sendMessage(msg.chat.id, "🛑 Bonding watch stopped.");
+});
+
+async function bondingWatchTick() {
+  if (!watchState.chats.length) return;
+  try {
+    const data = await fetchBondingTokens(100);
+    const list = (data?.result || data || []);
+    for (const t of list) {
+      const pct = parseFloat(t.bondingCurveProgress || 0);
+      if (pct >= 80 && !watchState.crossed[t.tokenAddress]) {
+        watchState.crossed[t.tokenAddress] = Date.now();
+        const txt =
+          `🚨 *Crossing bond:* *${escapeMd(t.symbol || "?")}*  ${pct.toFixed(0)}%\n` +
+          `\`${t.tokenAddress}\`\n` +
+          `💧 ${fmtNum(parseFloat(t.liquidity || 0), 1)} SOL · age ${ageStr(t.createdAt)}`;
+        for (const cid of watchState.chats) {
+          bot.sendMessage(cid, txt, { parse_mode: "Markdown" });
+        }
+      }
+    }
+    // GC: forget after 24h
+    const cutoff = Date.now() - 86400000;
+    for (const k of Object.keys(watchState.crossed)) {
+      if (watchState.crossed[k] < cutoff) delete watchState.crossed[k];
+    }
+    saveJson(WATCH_FILE, watchState);
+  } catch (e) {
+    console.error("watch tick err:", e.message);
+  }
+}
+setInterval(bondingWatchTick, 60_000);
+
 // ── Start ──────────────────────────────────────────────────────────
 
 console.log("🐸 Meme Intelligence Bot is running...");
+console.log(`💼 Wallet: ${walletState.publicKey}`);
